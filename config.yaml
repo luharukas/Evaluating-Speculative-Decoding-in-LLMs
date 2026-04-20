@@ -1,0 +1,39 @@
+models:
+  # Base LLM to evaluate
+  base_model: "meta-llama/Meta-Llama-3.1-8B-Instruct"
+  # Eagle3 draft model — must match the base model family
+  # Available Eagle3 checkpoints:
+  #   yuhuili/EAGLE3-LLaMA3.1-Instruct-8B
+  #   yuhuili/EAGLE3-LLaMA3.1-Instruct-70B
+  #   yuhuili/EAGLE3-Qwen2.5-Instruct-7B
+  eagle3_draft_model: "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B"
+
+speculative_decoding:
+  # Number of speculative tokens per draft step (5–6 is typical)
+  num_speculative_tokens: 5
+  # Draft model tensor parallel size (keep at 1 unless very large)
+  draft_tensor_parallel_size: 1
+
+generation:
+  max_new_tokens: 256
+  temperature: 0.0         # 0.0 = greedy; output should be identical to base
+  top_p: 1.0
+  repetition_penalty: 1.0
+
+evaluation:
+  # Dataset options: "sharegpt", "mt_bench", "custom"
+  dataset: "sharegpt"
+  num_samples: 100          # Number of prompts to evaluate
+  # Path to custom prompts file (JSONL with {"prompt": "..."} per line)
+  custom_prompts_path: null
+
+compute:
+  # vLLM GPU memory utilization (leave headroom if other processes are running)
+  gpu_memory_utilization: 0.45
+  dtype: "float16"
+  # Number of warmup runs before measurement
+  warmup_runs: 3
+
+output:
+  save_dir: "./results"
+  save_detailed_json: true   # Save per-request metrics
