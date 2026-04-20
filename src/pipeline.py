@@ -1,7 +1,6 @@
-"""Main pipeline: load config, run baseline + Eagle3, report metrics."""
+"""Main pipeline: load config, run all backends, report metrics."""
 
 import json
-import os
 import time
 from pathlib import Path
 from typing import Optional
@@ -10,11 +9,19 @@ import yaml
 from dotenv import load_dotenv
 
 from .dataset import load_dataset_prompts
-from .metrics import compare_outputs, print_comparison_table
-from .runners import BaseRunner, Eagle3Runner
+from .metrics import RunMetrics, compare_outputs, print_comparison_table, print_multi_run_table
+from .runners import (
+    BaseRunner,
+    Eagle3Runner,
+    TRTLLMBaseRunner,
+    TRTLLMEagle3Runner,
+)
 
 
-load_dotenv()  # Load environment variables from .env file if present
+load_dotenv()
+
+# Ordered keys used consistently for JSON output and table ordering
+_RUN_KEYS = ["vllm_baseline", "vllm_eagle3", "trtllm_baseline", "trtllm_eagle3"]
 
 
 def load_config(config_path: str) -> dict:
@@ -22,15 +29,23 @@ def load_config(config_path: str) -> dict:
         return yaml.safe_load(f)
 
 
+def _free_gpu():
+    try:
+        import torch
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
 class EaglePipeline:
-    """Orchestrates baseline and Eagle3 evaluation and reports all metrics."""
+    """Orchestrates baseline and Eagle3 evaluation across vLLM and TRT-LLM."""
 
     def __init__(self, config: dict):
         self.cfg = config
         self.results_dir = Path(config["output"]["save_dir"])
         self.results_dir.mkdir(parents=True, exist_ok=True)
 
-    def _load_prompts(self) -> list[str]:
+    def _load_prompts(self) -> list:
         eval_cfg = self.cfg["evaluation"]
         return load_dataset_prompts(
             dataset=eval_cfg["dataset"],
@@ -40,46 +55,46 @@ class EaglePipeline:
 
     def run(
         self,
-        run_baseline: bool = True,
-        run_eagle: bool = True,
-        skip_baseline: bool = False,
-    ):
+        run_vllm_baseline: bool = True,
+        run_vllm_eagle: bool = True,
+        run_trtllm_baseline: bool = False,
+        run_trtllm_eagle: bool = False,
+    ) -> dict:
         prompts = self._load_prompts()
         print(f"\n[Pipeline] Loaded {len(prompts)} prompts from '{self.cfg['evaluation']['dataset']}'")
 
-        gen_cfg = self.cfg["generation"]
+        gen_cfg     = self.cfg["generation"]
         compute_cfg = self.cfg["compute"]
-        models_cfg = self.cfg["models"]
-        spec_cfg = self.cfg["speculative_decoding"]
-        warmup = compute_cfg.get("warmup_runs", 3)
+        models_cfg  = self.cfg["models"]
+        spec_cfg    = self.cfg["speculative_decoding"]
+        warmup      = compute_cfg.get("warmup_runs", 3)
 
-        baseline_metrics = None
-        eagle_metrics = None
+        # TRT-LLM may need a different GPU utilization (managed differently from vLLM)
+        trt_gpu_util = (
+            self.cfg.get("tensorrt_llm", {}).get("gpu_memory_utilization")
+            or compute_cfg["gpu_memory_utilization"]
+        )
 
-        # ── Baseline Run ──────────────────────────────────────────────────────
-        if run_baseline and not skip_baseline:
-            print("\n[Pipeline] === BASELINE RUN (no speculative decoding) ===")
-            base_runner = BaseRunner(
+        results: dict[str, Optional[RunMetrics]] = {k: None for k in _RUN_KEYS}
+
+        # ── vLLM Baseline ─────────────────────────────────────────────────────
+        if run_vllm_baseline:
+            print("\n[Pipeline] === vLLM BASELINE ===")
+            runner = BaseRunner(
                 model=models_cfg["base_model"],
                 max_new_tokens=gen_cfg["max_new_tokens"],
                 temperature=gen_cfg["temperature"],
                 gpu_memory_utilization=compute_cfg["gpu_memory_utilization"],
                 dtype=compute_cfg["dtype"],
             )
-            baseline_collector = base_runner.run(prompts, warmup_runs=warmup)
-            baseline_metrics = baseline_collector.build()
-            # Free GPU memory before loading Eagle3
-            del base_runner
-            try:
-                import torch
-                torch.cuda.empty_cache()
-            except Exception:
-                pass
+            results["vllm_baseline"] = runner.run(prompts, warmup_runs=warmup).build()
+            del runner
+            _free_gpu()
 
-        # ── Eagle3 Run ────────────────────────────────────────────────────────
-        if run_eagle:
-            print("\n[Pipeline] === EAGLE3 SPECULATIVE DECODING RUN ===")
-            eagle_runner = Eagle3Runner(
+        # ── vLLM Eagle3 ───────────────────────────────────────────────────────
+        if run_vllm_eagle:
+            print("\n[Pipeline] === vLLM EAGLE3 ===")
+            runner = Eagle3Runner(
                 base_model=models_cfg["base_model"],
                 draft_model=models_cfg["eagle3_draft_model"],
                 num_speculative_tokens=spec_cfg["num_speculative_tokens"],
@@ -89,32 +104,84 @@ class EaglePipeline:
                 dtype=compute_cfg["dtype"],
                 draft_tensor_parallel_size=spec_cfg.get("draft_tensor_parallel_size", 1),
             )
-            eagle_collector = eagle_runner.run(prompts, warmup_runs=warmup)
-            eagle_metrics = eagle_collector.build()
-            del eagle_runner
+            results["vllm_eagle3"] = runner.run(prompts, warmup_runs=warmup).build()
+            del runner
+            _free_gpu()
+
+        # ── TRT-LLM Baseline ──────────────────────────────────────────────────
+        if run_trtllm_baseline:
+            print("\n[Pipeline] === TRT-LLM BASELINE ===")
             try:
-                import torch
-                torch.cuda.empty_cache()
-            except Exception:
-                pass
+                runner = TRTLLMBaseRunner(
+                    model=models_cfg["base_model"],
+                    max_new_tokens=gen_cfg["max_new_tokens"],
+                    temperature=gen_cfg["temperature"],
+                    gpu_memory_utilization=trt_gpu_util,
+                    dtype=compute_cfg["dtype"],
+                )
+                results["trtllm_baseline"] = runner.run(prompts, warmup_runs=warmup).build()
+                runner.shutdown()
+                del runner
+                _free_gpu()
+            except ImportError as e:
+                print(f"[Pipeline] Skipping TRT-LLM baseline — {e}")
 
-        # ── Compare & Report ─────────────────────────────────────────────────
-        if baseline_metrics and eagle_metrics:
-            eagle_metrics.exact_match_rate = compare_outputs(baseline_metrics, eagle_metrics)
-            print_comparison_table(baseline_metrics, eagle_metrics)
-            self._save_results(baseline_metrics, eagle_metrics)
-        elif baseline_metrics:
-            self._print_single_run(baseline_metrics)
-            self._save_single(baseline_metrics, "baseline")
-        elif eagle_metrics:
-            self._print_single_run(eagle_metrics)
-            self._save_single(eagle_metrics, "eagle3")
+        # ── TRT-LLM Eagle3 ────────────────────────────────────────────────────
+        if run_trtllm_eagle:
+            print("\n[Pipeline] === TRT-LLM EAGLE3 ===")
+            try:
+                runner = TRTLLMEagle3Runner(
+                    base_model=models_cfg["base_model"],
+                    draft_model=models_cfg["eagle3_draft_model"],
+                    num_speculative_tokens=spec_cfg["num_speculative_tokens"],
+                    max_new_tokens=gen_cfg["max_new_tokens"],
+                    temperature=gen_cfg["temperature"],
+                    gpu_memory_utilization=trt_gpu_util,
+                    dtype=compute_cfg["dtype"],
+                )
+                results["trtllm_eagle3"] = runner.run(prompts, warmup_runs=warmup).build()
+                runner.shutdown()
+                del runner
+                _free_gpu()
+            except ImportError as e:
+                print(f"[Pipeline] Skipping TRT-LLM Eagle3 — {e}")
 
-        return baseline_metrics, eagle_metrics
+        # ── Compare & Report ──────────────────────────────────────────────────
+        present = {k: v for k, v in results.items() if v is not None}
+        if not present:
+            print("[Pipeline] No runs completed.")
+            return results
 
-    def _print_single_run(self, m):
+        # Compute exact-match rate for every run vs vLLM baseline (or first run)
+        ref = present.get("vllm_baseline") or next(iter(present.values()))
+        for key, m in present.items():
+            if m is not ref:
+                m.exact_match_rate = compare_outputs(ref, m)
+
+        runs_ordered = [present[k] for k in _RUN_KEYS if k in present]
+
+        if len(runs_ordered) >= 3:
+            print_multi_run_table(runs_ordered)
+        elif len(runs_ordered) == 2:
+            a, b = runs_ordered
+            # Use legacy 2-way table only for the original vllm pair
+            if {a.run_type, b.run_type} == {"baseline", "eagle3"}:
+                print_comparison_table(a, b)
+            else:
+                print_multi_run_table(runs_ordered)
+        else:
+            self._print_single_run(runs_ordered[0])
+
+        if self.cfg["output"].get("save_detailed_json", True):
+            self._save_results(results)
+
+        return results
+
+    # ── Internal helpers ──────────────────────────────────────────────────────
+
+    def _print_single_run(self, m: RunMetrics):
         print(f"\n{'='*50}")
-        print(f"  {m.run_type.upper()} RESULTS — {m.model}")
+        print(f"  {m.run_type.upper()} — {m.model}")
         print(f"{'='*50}")
         print(f"  Samples          : {m.num_samples}")
         print(f"  Total Time (s)   : {m.total_time:.1f}")
@@ -129,28 +196,20 @@ class EaglePipeline:
             print(f"  Accepted/Step    : {m.mean_accepted_per_step:.2f}")
         print(f"{'='*50}\n")
 
-    def _save_results(self, baseline, eagle):
+    def _save_results(self, all_results: dict):
         ts = int(time.time())
-        out = {
-            "timestamp": ts,
-            "baseline": baseline.to_dict(),
-            "eagle3": eagle.to_dict(),
-        }
-        if self.cfg["output"].get("save_detailed_json"):
-            out["baseline"]["per_request"] = baseline.per_request
-            out["eagle3"]["per_request"] = eagle.per_request
+        save_detailed = self.cfg["output"].get("save_detailed_json", True)
+
+        out: dict = {"timestamp": ts}
+        for key, m in all_results.items():
+            if m is None:
+                out[key] = None
+                continue
+            out[key] = m.to_dict()
+            if save_detailed:
+                out[key]["per_request"] = m.per_request
 
         path = self.results_dir / f"results_{ts}.json"
-        with open(path, "w") as f:
-            json.dump(out, f, indent=2, default=str)
-        print(f"[Pipeline] Results saved to {path}")
-
-    def _save_single(self, metrics, tag: str):
-        ts = int(time.time())
-        out = {tag: metrics.to_dict()}
-        if self.cfg["output"].get("save_detailed_json"):
-            out[tag]["per_request"] = metrics.per_request
-        path = self.results_dir / f"results_{tag}_{ts}.json"
         with open(path, "w") as f:
             json.dump(out, f, indent=2, default=str)
         print(f"[Pipeline] Results saved to {path}")

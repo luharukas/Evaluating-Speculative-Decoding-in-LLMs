@@ -34,6 +34,11 @@ compute:
   # Number of warmup runs before measurement
   warmup_runs: 3
 
+tensorrt_llm:
+  # TRT-LLM manages KV cache differently from vLLM; can usually use a higher fraction.
+  # Set to null to inherit compute.gpu_memory_utilization.
+  gpu_memory_utilization: 0.45
+
 output:
   save_dir: "./results"
   save_detailed_json: true   # Save per-request metrics

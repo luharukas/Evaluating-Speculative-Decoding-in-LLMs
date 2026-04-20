@@ -1,124 +1,148 @@
 # Evaluating Speculative Decoding in LLMs
 
-This repository benchmarks standard vLLM decoding against Eagle3 speculative decoding and reports latency, throughput, token acceptance, and output agreement metrics.
+Benchmarks Eagle3 speculative decoding across two inference backends:
 
-The current pipeline is built around:
+- **vLLM** (tested: 0.19.0)
+- **TensorRT-LLM** (tested: 1.2.1)
 
-- A base instruction model served through `vllm.LLM`
-- An Eagle3 draft model paired with the same model family
-- A config-driven evaluation loop over built-in or custom prompts
-- JSON result dumps with both aggregate metrics and optional per-request details
+Compares baseline decoding vs Eagle3 speculative decoding, reporting latency, throughput, acceptance rate, and output-agreement metrics.
+
+---
 
 ## What It Measures
 
-For each run, the project records:
+| Metric | Description |
+|--------|-------------|
+| TTFT | Time to first token (ms) |
+| E2E latency | Full generation latency (ms) |
+| TPS | Output tokens per second, per request |
+| Throughput | Total tokens per second across all requests |
+| Acceptance rate | Fraction of drafted tokens accepted (Eagle3 only) |
+| Accepted/step | Average accepted draft tokens per speculative step (Eagle3 only) |
+| Exact-match rate | Output agreement rate vs vLLM baseline reference |
 
-- Time to first token (TTFT)
-- End-to-end generation latency
-- Per-request tokens per second
-- Overall throughput in tokens per second
-- Eagle3 token acceptance rate
-- Average accepted draft tokens per step
-- Exact-match rate between baseline and speculative outputs
-
-This makes it useful for checking whether speculative decoding gives a real speedup on your hardware and whether greedy outputs stay close to the baseline.
+---
 
 ## Repository Layout
 
 ```text
 .
-├── config.yaml          # Default benchmark configuration
-├── requirements.txt     # Python dependencies
-├── run_pipeline.py      # CLI entrypoint
-├── results/             # Saved benchmark JSON files
+├── config.yaml              # Default benchmark configuration
+├── requirements-vllm.txt    # vLLM environment snapshot
+├── run_pipeline.py          # CLI entrypoint
+├── results/                 # Saved benchmark JSON files
 └── src/
-    ├── dataset.py       # Prompt loaders
-    ├── metrics.py       # Aggregation and reporting
-    ├── pipeline.py      # End-to-end orchestration
-    └── runners.py       # Baseline and Eagle3 vLLM runners
+    ├── dataset.py           # Prompt loaders (ShareGPT, MT-Bench, custom)
+    ├── metrics.py           # Aggregation and reporting
+    ├── pipeline.py          # End-to-end orchestration
+    └── runners.py           # vLLM and TRT-LLM runners
 ```
+
+---
 
 ## How The Pipeline Works
 
-1. Load config from `config.yaml` and apply any CLI overrides.
-2. Load prompts from one of three sources:
-   - `sharegpt`
-   - `mt_bench`
-   - `custom`
-3. Run a baseline decode pass with the base model.
-4. Run an Eagle3 speculative decode pass with the same base model plus a draft model.
-5. Aggregate metrics and print a comparison table.
-6. Save results to `results/results_<timestamp>.json`.
+1. Load `config.yaml`, apply any CLI overrides.
+2. Load prompts from `sharegpt`, `mt_bench`, or a custom JSONL file.
+3. Run any combination of four variants:
+   - `vllm_baseline` — vLLM, no speculative decoding
+   - `vllm_eagle3` — vLLM + Eagle3 draft model
+   - `trtllm_baseline` — TRT-LLM, no speculative decoding
+   - `trtllm_eagle3` — TRT-LLM + Eagle3 draft model
+4. Aggregate metrics and print a comparison table.
+5. Save results to `results/results_<timestamp>.json`.
 
-If only one mode is requested, the pipeline saves a single-run result file instead.
+---
 
-## Requirements
-
-This project assumes a machine capable of running vLLM with the selected models. In practice, that means:
+## Prerequisites
 
 - Linux
-- NVIDIA GPU(s) with a CUDA stack compatible with your installed PyTorch and vLLM versions
-- Enough VRAM for the base model and, for speculative decoding, the Eagle3 draft model
-- Python environment able to install the packages in `requirements.txt`
+- NVIDIA GPU with enough VRAM for the base model (and the Eagle3 draft model for speculative runs)
+- CUDA stack compatible with the backend you install
+- HuggingFace credentials configured if your model checkpoints are gated
 
-The default config uses:
+Default models used:
 
-- Base model: `meta-llama/Meta-Llama-3.1-8B-Instruct`
-- Draft model: `yuhuili/EAGLE3-LLaMA3.1-Instruct-8B`
+| Role | Model |
+|------|-------|
+| Base model | `meta-llama/Meta-Llama-3.1-8B-Instruct` |
+| Eagle3 draft | `yuhuili/EAGLE3-LLaMA3.1-Instruct-8B` |
 
-You will typically also need Hugging Face access configured for gated models if your chosen checkpoints require it.
+---
 
 ## Installation
 
-Create and activate an environment, then install dependencies:
+vLLM and TensorRT-LLM have conflicting dependencies. Use **two separate virtual environments**.
+
+### Shared dependencies (both envs)
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+pip install numpy PyYAML python-dotenv tabulate datasets
 ```
 
-If you want the `sharegpt` dataset loader to fetch prompts from Hugging Face, make sure the `datasets` package is installed in your environment as well. If dataset loading fails, the code falls back to the built-in prompt set.
+### vLLM environment
 
-Optional: create a `.env` file for any environment variables needed by your local Hugging Face or vLLM setup. The entrypoint loads `.env` automatically.
+```bash
+python -m venv .venvvllm
+.venvvllm/bin/pip install vllm==0.19.0
+.venvvllm/bin/pip install numpy PyYAML python-dotenv tabulate datasets
+```
+
+The full vLLM environment snapshot is in `requirements-vllm.txt`.
+
+### TensorRT-LLM environment
+
+```bash
+python -m venv .venvtrtllm
+.venvtrtllm/bin/pip install tensorrt-llm==1.2.1
+.venvtrtllm/bin/pip install numpy PyYAML python-dotenv tabulate datasets ninja
+```
+
+> **`ninja` is required.** TensorRT-LLM uses FlashInfer JIT compilation which calls `ninja` at runtime. Install it into the same virtual environment — `pip install ninja`.
+
+### HuggingFace access
+
+Create a `.env` file for tokens if needed:
+
+```bash
+HF_TOKEN=hf_...
+```
+
+The entrypoint loads `.env` automatically.
+
+---
 
 ## Quick Start
 
-Run the default benchmark:
+Run only TRT-LLM:
 
 ```bash
-python run_pipeline.py
+./.venvtrtllm/bin/python run_pipeline.py --backend trtllm
 ```
 
-Run only baseline decoding:
+Run only vLLM:
 
 ```bash
-python run_pipeline.py --baseline-only
+./.venvvllm/bin/python run_pipeline.py --backend vllm
 ```
 
-Run only Eagle3 speculative decoding:
+Smoke test (fast):
 
 ```bash
-python run_pipeline.py --eagle-only
+./.venvtrtllm/bin/python run_pipeline.py --backend trtllm --num-samples 5 --warmup-runs 1
 ```
 
-Use different checkpoints:
+Eagle3 only (skip baselines):
 
 ```bash
-python run_pipeline.py \
-  --base-model meta-llama/Meta-Llama-3.1-8B-Instruct \
-  --eagle3-model yuhuili/EAGLE3-LLaMA3.1-Instruct-8B
+./.venvtrtllm/bin/python run_pipeline.py --backend trtllm --eagle-only
 ```
 
-Use fewer prompts for a quick smoke test:
-
-```bash
-python run_pipeline.py --num-samples 10 --warmup-runs 1
-```
+---
 
 ## Configuration
 
-Default settings live in `config.yaml`.
+`config.yaml` controls all defaults:
 
 ```yaml
 models:
@@ -142,6 +166,9 @@ compute:
   dtype: "float16"
   warmup_runs: 3
 
+tensorrt_llm:
+  gpu_memory_utilization: 0.45
+
 output:
   save_dir: "./results"
   save_detailed_json: true
@@ -149,119 +176,133 @@ output:
 
 Key settings:
 
-- `models.base_model`: main model used for baseline and verification
-- `models.eagle3_draft_model`: Eagle3 draft checkpoint, expected to match the base model family
-- `speculative_decoding.num_speculative_tokens`: draft tokens proposed per speculative step
-- `generation.max_new_tokens`: output length cap per prompt
-- `generation.temperature`: defaults to `0.0` for deterministic greedy decoding
-- `evaluation.dataset`: `sharegpt`, `mt_bench`, or `custom`
-- `evaluation.custom_prompts_path`: JSONL file path for `custom` mode
-- `compute.gpu_memory_utilization`: vLLM memory target
-- `compute.warmup_runs`: warmup generations before measurement
-- `output.save_detailed_json`: whether to store per-request records
+| Key | Description |
+|-----|-------------|
+| `models.base_model` | Main model for baseline and target verification |
+| `models.eagle3_draft_model` | Eagle3 draft checkpoint — must match base model family |
+| `speculative_decoding.num_speculative_tokens` | Draft tokens proposed per speculative step (5–6 typical) |
+| `generation.temperature` | `0.0` = greedy decoding, deterministic output |
+| `evaluation.dataset` | `sharegpt`, `mt_bench`, or `custom` |
+| `compute.gpu_memory_utilization` | vLLM GPU memory fraction |
+| `tensorrt_llm.gpu_memory_utilization` | TRT-LLM GPU memory fraction (overrides compute value if set) |
+| `output.save_detailed_json` | Include per-request records in output JSON |
 
-## CLI Options
+---
 
-`run_pipeline.py` supports overriding the config from the command line:
+## CLI Reference
 
 ```bash
-python run_pipeline.py --config my_config.yaml
+# Backend selection
+python run_pipeline.py --backend vllm
+python run_pipeline.py --backend trtllm
+python run_pipeline.py --backend both          # default
+
+# Run selection
+python run_pipeline.py --baseline-only         # skip Eagle3 variants
+python run_pipeline.py --eagle-only            # skip baseline variants
+
+# Model overrides
+python run_pipeline.py --base-model <hf_id_or_path>
+python run_pipeline.py --eagle3-model <hf_id_or_path>
+
+# Generation settings
 python run_pipeline.py --num-samples 50
 python run_pipeline.py --max-new-tokens 128
 python run_pipeline.py --num-speculative-tokens 6
+python run_pipeline.py --gpu-util 0.6
+python run_pipeline.py --warmup-runs 1
+
+# Dataset
 python run_pipeline.py --dataset mt_bench
 python run_pipeline.py --prompts data/prompts.jsonl
-python run_pipeline.py --gpu-util 0.6
+
+# Output
 python run_pipeline.py --results-dir ./my_results
 python run_pipeline.py --no-save
+
+# Config file
+python run_pipeline.py --config my_config.yaml
 ```
+
+---
 
 ## Datasets
 
-The benchmark supports three prompt sources:
+| Source | Description |
+|--------|-------------|
+| `sharegpt` | ShareGPT-style dataset loaded from HuggingFace; falls back to built-in prompts on failure |
+| `mt_bench` | Built-in prompt set covering reasoning, coding, writing, and math |
+| `custom` | JSONL file, one prompt per line |
 
-- `sharegpt`: tries to load a ShareGPT-style dataset from Hugging Face
-- `mt_bench`: uses a built-in prompt list covering reasoning, coding, writing, and math
-- `custom`: reads a JSONL file that contains one prompt per line
-
-Custom prompt file format:
+Custom JSONL format (both `prompt` and `text` keys accepted):
 
 ```jsonl
 {"prompt": "Explain speculative decoding in simple terms."}
-{"prompt": "Write a Python function that reverses a linked list."}
-{"text": "Summarize how vLLM computes TTFT."}
+{"text": "Write a Python function that reverses a linked list."}
 ```
 
-Both `prompt` and `text` keys are accepted by the loader.
+---
 
-## Output
+## Output Format
 
-When both runs are executed, the pipeline writes files like:
-
-```text
-results/results_1776654821.json
-```
-
-Top-level structure:
+Results are written to `results/results_<unix_timestamp>.json`:
 
 ```json
 {
-  "timestamp": 1776654821,
-  "baseline": { "... aggregate metrics ..." },
-  "eagle3": { "... aggregate metrics ..." }
+  "timestamp": 1776687816,
+  "vllm_baseline": { ... },
+  "vllm_eagle3": { ... },
+  "trtllm_baseline": { ... },
+  "trtllm_eagle3": { ... }
 }
 ```
 
-Each run includes aggregate fields such as:
+Each run block contains:
 
-- `num_samples`
-- `total_time`
-- `total_prompt_tokens`
-- `total_output_tokens`
-- `mean_ttft_ms`, `p50_ttft_ms`, `p90_ttft_ms`, `p99_ttft_ms`
-- `mean_e2e_latency_ms`, `p50_e2e_latency_ms`, `p90_e2e_latency_ms`, `p99_e2e_latency_ms`
-- `mean_tps`
-- `throughput_tps`
-- `mean_acceptance_rate` and `mean_accepted_per_step` for Eagle3
-- `exact_match_rate` when both baseline and Eagle3 outputs are available
+**Aggregate fields:**
+`num_samples`, `total_time`, `total_prompt_tokens`, `total_output_tokens`,
+`mean_ttft_ms`, `p50_ttft_ms`, `p90_ttft_ms`, `p99_ttft_ms`,
+`mean_e2e_latency_ms`, `p50_e2e_latency_ms`, `p90_e2e_latency_ms`, `p99_e2e_latency_ms`,
+`mean_tps`, `throughput_tps`,
+`mean_acceptance_rate` *(Eagle3 only)*, `mean_accepted_per_step` *(Eagle3 only)*,
+`exact_match_rate` *(non-reference runs)*
 
-If `save_detailed_json: true`, each run also includes a `per_request` array with:
+**Per-request fields** (when `save_detailed_json: true`):
+prompt text, generated output, prompt/output token counts, TTFT, E2E latency, TPS, accepted tokens, acceptance rate.
 
-- prompt text
-- generated output text
-- prompt and output token counts
-- TTFT
-- end-to-end latency
-- per-request TPS
-- speculative decoding estimates such as accepted tokens and acceptance rate
+---
 
-These files can become large because they store full generated text for every prompt.
+## Known Issues and Gotchas
 
-## Interpreting Results
+**`ninja` not found at runtime**
+TRT-LLM triggers FlashInfer JIT kernel compilation on the first model run. This calls `ninja` as a subprocess. If you invoke the script without activating the venv (`./venv/bin/python run_pipeline.py`), the venv `bin/` is added to PATH automatically — but only if `ninja` was installed into that venv via `pip install ninja`.
 
-- Higher `throughput_tps` means better overall generation throughput.
-- Lower `mean_e2e_latency_ms` means faster full responses.
-- Lower `mean_ttft_ms` means faster first-token responsiveness.
-- Higher `mean_acceptance_rate` usually indicates the draft model is helping more.
-- Higher `exact_match_rate` means speculative outputs stayed closer to the baseline outputs.
+**TRT-LLM API version compatibility**
+This repo targets TRT-LLM 1.x. The Eagle3 config class is `EagleDecodingConfig` (not `EagleConfig` from older docs). Required fields: `speculative_model`, `max_draft_len`.
 
-Be careful with `exact_match_rate`: it is a strict string match, not a semantic similarity score.
+**`TLLM_WORKER_USE_SINGLE_PROCESS=1`**
+Set automatically for TP=1 runs to avoid MPI worker spawning on single-GPU setups.
 
-## Notes And Caveats
+**vLLM Eagle3 acceptance stats**
+Per-request acceptance rates are estimated heuristically. When vLLM's stat logger emits aggregate spec-decode metrics, those override the estimates.
 
-- The code is written around the vLLM speculative decoding API used in the current runner implementation.
-- `temperature` defaults to `0.0` so output differences mostly reflect decoding-path differences rather than sampling noise.
-- The `sharegpt` loader falls back to built-in prompts if Hugging Face dataset loading fails.
-- Eagle3 acceptance metrics are estimated per request and then replaced with aggregated log-based values when vLLM emits usable speculative decoding stats.
-- Benchmark numbers are hardware-dependent. Compare runs on the same machine and under similar load.
+**TRT-LLM Eagle3 acceptance stats**
+Currently heuristic-only per request.
+
+**Benchmark portability**
+Numbers are hardware-dependent. Compare runs only on the same machine under similar GPU load.
+
+---
 
 ## Typical Workflow
 
-1. Pick a base model and a compatible Eagle3 draft model.
-2. Start with `--num-samples 10` to confirm the setup works.
-3. Increase to a larger sample count for stable measurements.
-4. Compare throughput, latency, and exact-match rate.
-5. Tune `num_speculative_tokens` and GPU utilization for your hardware.
+1. Create the venv for your target backend and install dependencies.
+2. Smoke-test with `--num-samples 5 --warmup-runs 1`.
+3. Run full evaluation with `--num-samples 100` (default).
+4. Tune `num_speculative_tokens` (5–6 is typical) and `gpu_memory_utilization` for your GPU.
+5. Compare throughput, TTFT, and exact-match rate across backends.
+
+---
 
 ## License
 

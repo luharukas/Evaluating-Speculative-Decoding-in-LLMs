@@ -150,6 +150,111 @@ def compare_outputs(baseline: RunMetrics, eagle: RunMetrics) -> float:
     return matches / len(b_outputs)
 
 
+_RUN_LABELS = {
+    "baseline": "vLLM Baseline",
+    "eagle3": "vLLM Eagle3",
+    "trtllm_baseline": "TRT-LLM Baseline",
+    "trtllm_eagle3": "TRT-LLM Eagle3",
+}
+
+
+def print_multi_run_table(runs: list):
+    """Print N-way comparison table. Speedup columns computed vs first run."""
+    try:
+        from tabulate import tabulate
+        use_tabulate = True
+    except ImportError:
+        use_tabulate = False
+
+    if not runs:
+        return
+
+    headers = ["Metric"] + [_RUN_LABELS.get(r.run_type, r.run_type) for r in runs]
+
+    def _speedup(values: list, higher_is_better: bool) -> list:
+        base = values[0]
+        out: list = []
+        for i, v in enumerate(values):
+            if i == 0 or v is None or not base:
+                out.append("—")
+            else:
+                ratio = (v / base) if higher_is_better else (base / v)
+                out.append(f"{ratio:.2f}x")
+        return out
+
+    rows = []
+
+    # TTFT
+    rows.append(["Mean TTFT (ms)"] + [f"{r.mean_ttft_ms:.1f}" for r in runs])
+    rows.append(["P50 TTFT (ms)"]  + [f"{r.p50_ttft_ms:.1f}"  for r in runs])
+    rows.append(["P90 TTFT (ms)"]  + [f"{r.p90_ttft_ms:.1f}"  for r in runs])
+    rows.append(["P99 TTFT (ms)"]  + [f"{r.p99_ttft_ms:.1f}"  for r in runs])
+
+    # E2E latency
+    rows.append(["Mean E2E Latency (ms)"] + [f"{r.mean_e2e_latency_ms:.1f}" for r in runs])
+    rows.append(["P50 E2E Latency (ms)"]  + [f"{r.p50_e2e_latency_ms:.1f}" for r in runs])
+    rows.append(["P90 E2E Latency (ms)"]  + [f"{r.p90_e2e_latency_ms:.1f}" for r in runs])
+    rows.append(
+        ["  E2E Speedup vs [0]"]
+        + _speedup([r.mean_e2e_latency_ms for r in runs], higher_is_better=False)
+    )
+
+    # Throughput
+    rows.append(["Mean TPS (per-req)"] + [f"{r.mean_tps:.1f}" for r in runs])
+    rows.append(["Throughput (tok/s)"] + [f"{r.throughput_tps:.1f}" for r in runs])
+    rows.append(
+        ["  Throughput Speedup vs [0]"]
+        + _speedup([r.throughput_tps for r in runs], higher_is_better=True)
+    )
+
+    # Counts & time
+    rows.append(["Total Output Tokens"] + [str(r.total_output_tokens) for r in runs])
+    rows.append(["Total Time (s)"]      + [f"{r.total_time:.1f}" for r in runs])
+
+    # Spec-decoding stats
+    rows.append([
+        "Token Acceptance Rate"
+    ] + [
+        f"{r.mean_acceptance_rate:.3f}" if r.mean_acceptance_rate is not None else "N/A"
+        for r in runs
+    ])
+    rows.append([
+        "Avg Accepted Tok/Step"
+    ] + [
+        f"{r.mean_accepted_per_step:.2f}" if r.mean_accepted_per_step is not None else "N/A"
+        for r in runs
+    ])
+
+    # Exact match vs first run
+    rows.append([
+        "Output Exact Match vs [0]"
+    ] + [
+        "—" if i == 0
+        else (f"{r.exact_match_rate:.1%}" if r.exact_match_rate is not None else "N/A")
+        for i, r in enumerate(runs)
+    ])
+
+    sep = "=" * (28 + 16 * len(runs))
+    print(f"\n{sep}")
+    print("  INFERENCE BACKEND COMPARISON")
+    print(sep)
+    print(f"  Base model : {runs[0].model}")
+    draft_models = [r.draft_model for r in runs if r.draft_model]
+    if draft_models:
+        print(f"  Draft model: {draft_models[0]}")
+    print(f"  Samples    : {runs[0].num_samples}")
+    print(sep)
+    if use_tabulate:
+        print(tabulate(rows, headers=headers, tablefmt="rounded_outline"))
+    else:
+        col_w = [28] + [16] * len(runs)
+        print("  " + "  ".join(h.ljust(w) for h, w in zip(headers, col_w)))
+        print("  " + "-" * (sum(col_w) + len(col_w) * 2))
+        for row in rows:
+            print("  " + "  ".join(str(v).ljust(w) for v, w in zip(row, col_w)))
+    print(sep + "\n")
+
+
 def print_comparison_table(baseline: RunMetrics, eagle: RunMetrics):
     """Print a formatted side-by-side comparison table."""
     try:

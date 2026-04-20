@@ -1,12 +1,23 @@
-"""vLLM-based runners for baseline and Eagle3 speculative decoding.
+"""Inference runners for baseline and Eagle3 speculative decoding.
 
-vLLM 0.19.1 API notes:
-- Speculative decoding uses `speculative_config` dict (not `speculative_model`)
-- `RequestOutput.metrics` (RequestStateStats) provides built-in TTFT and timestamps
+Backends:
+  vLLM 0.19.1  — BaseRunner, Eagle3Runner
+  TRT-LLM 0.15+ — TRTLLMBaseRunner, TRTLLMEagle3Runner
+
+vLLM notes:
+- Speculative decoding uses `speculative_config` dict
+- `RequestOutput.metrics` provides built-in TTFT and timestamps
 - Spec decode acceptance stats are accessed via the engine's stat logger
+
+TRT-LLM notes:
+- High-level `tensorrt_llm.LLM` API loads HF models directly (no manual engine build)
+- TTFT measured via `generate_async` streaming; falls back to estimation if unavailable
+- Eagle3 mapped to TRT-LLM EagleConfig (draft-model speculative decoding)
+- Call `runner.shutdown()` before `del` to properly release GPU memory
 """
 
 import logging
+import os
 import re
 import time
 from typing import Optional
@@ -302,3 +313,278 @@ class Eagle3Runner:
                   f"Mean acceptance length: {mal:.2f}")
 
         return collector
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TRT-LLM helpers
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _trtllm_check_import():
+    try:
+        import tensorrt_llm  # noqa: F401
+    except ImportError as e:
+        raise ImportError(
+            "TensorRT-LLM not installed. "
+            "See: https://nvidia.github.io/TensorRT-LLM/installation/linux.html"
+        ) from e
+
+
+def _trtllm_maybe_enable_single_process_tp1():
+    """Avoid MPI worker spawning for the benchmark's TRT-LLM TP=1 path.
+
+    This repo currently exercises TRT-LLM with tensor-parallel size 1. TRT-LLM
+    can route that through a single-process worker when
+    `TLLM_WORKER_USE_SINGLE_PROCESS=1` is set, which sidesteps MPI-based worker
+    orchestration. That is the safer default for local PyPI installs, even on
+    hosts that physically have multiple GPUs.
+    """
+    if "TLLM_WORKER_USE_SINGLE_PROCESS" in os.environ:
+        return
+
+    os.environ["TLLM_WORKER_USE_SINGLE_PROCESS"] = "1"
+
+
+def _trtllm_kv_cache(gpu_memory_utilization: float):
+    """Build KvCacheConfig; returns None if the class is unavailable."""
+    try:
+        from tensorrt_llm.llmapi import KvCacheConfig
+        return KvCacheConfig(free_gpu_memory_fraction=gpu_memory_utilization)
+    except ImportError:
+        return None
+
+
+def _trtllm_eagle_config(draft_model: str, num_draft_tokens: int):
+    """Build TRT-LLM Eagle3 speculative-decoding config (TRT-LLM 1.x API)."""
+    try:
+        from tensorrt_llm.llmapi import EagleDecodingConfig
+        return EagleDecodingConfig(
+            speculative_model=draft_model,
+            max_draft_len=num_draft_tokens,
+        )
+    except (ImportError, TypeError):
+        pass
+    raise ImportError(
+        "Cannot import EagleDecodingConfig from TensorRT-LLM. "
+        "Ensure TRT-LLM >= 1.0 is installed."
+    )
+
+
+def _trtllm_run_prompt(llm, prompt: str, sampling_params) -> tuple:
+    """Run one prompt through TRT-LLM; returns (RequestOutput, ttft_sec, e2e_sec).
+
+    Uses asyncio + generate_async(streaming=True) for accurate TTFT.
+    Falls back to batch generate + estimated TTFT if async fails.
+    """
+    import asyncio
+
+    async def _stream():
+        ttft = 0.0
+        first = True
+        final = None
+        t0 = time.perf_counter()
+        async for out in llm.generate_async(
+            prompt, sampling_params=sampling_params, streaming=True
+        ):
+            if first:
+                ttft = time.perf_counter() - t0
+                first = False
+            final = out
+        e2e = time.perf_counter() - t0
+        return final, ttft, e2e
+
+    try:
+        return asyncio.run(_stream())
+    except Exception:
+        # Fallback: sync generate, estimate TTFT from per-token rate
+        t0 = time.perf_counter()
+        results = llm.generate([prompt], sampling_params)
+        e2e = time.perf_counter() - t0
+        out = results[0] if results else None
+        if out is None:
+            return None, 0.0, e2e
+        n_toks = len(getattr(out.outputs[0], "token_ids", None) or []) or 1
+        return out, e2e / n_toks, e2e
+
+
+def _trtllm_parse_output(out) -> tuple:
+    """Extract (text, output_tokens, prompt_tokens) from TRT-LLM RequestOutput."""
+    comp = out.outputs[0]
+    text = comp.text or ""
+    token_ids = getattr(comp, "token_ids", None) or []
+    output_tokens = len(token_ids) if token_ids else max(1, len(text.split()))
+    prompt_token_ids = getattr(out, "prompt_token_ids", None) or []
+    prompt_tokens = len(prompt_token_ids)
+    return text, output_tokens, prompt_tokens
+
+
+# ── TRT-LLM Runners ───────────────────────────────────────────────────────────
+
+class TRTLLMBaseRunner:
+    """TRT-LLM baseline runner — plain LLM, no speculative decoding."""
+
+    def __init__(
+        self,
+        model: str,
+        max_new_tokens: int = 256,
+        temperature: float = 0.0,
+        gpu_memory_utilization: float = 0.45,
+        dtype: str = "float16",
+    ):
+        _trtllm_maybe_enable_single_process_tp1()
+        _trtllm_check_import()
+        from tensorrt_llm import LLM, SamplingParams
+
+        print(f"[TRTLLMBaseRunner] Loading {model} ...")
+        self.model = model
+
+        init_kw: dict = dict(model=model, dtype=dtype, trust_remote_code=True)
+        kv = _trtllm_kv_cache(gpu_memory_utilization)
+        if kv is not None:
+            init_kw["kv_cache_config"] = kv
+
+        self.llm = LLM(**init_kw)
+        self.sampling_params = SamplingParams(
+            max_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=1.0,
+        )
+        print("[TRTLLMBaseRunner] Model loaded.")
+
+    def warmup(self, prompts: list, n: int = 3):
+        print(f"[TRTLLMBaseRunner] Warming up ({n} runs) ...")
+        for _ in range(n):
+            self.llm.generate(prompts[:1], self.sampling_params)
+
+    def run(self, prompts: list, warmup_runs: int = 3) -> MetricsCollector:
+        self.warmup(prompts, warmup_runs)
+        collector = MetricsCollector(run_type="trtllm_baseline", model=self.model)
+        print(f"[TRTLLMBaseRunner] Running {len(prompts)} prompts ...")
+
+        collector.start_run()
+        for i, prompt in enumerate(prompts):
+            out, ttft, e2e = _trtllm_run_prompt(self.llm, prompt, self.sampling_params)
+            if out is None:
+                continue
+
+            text, output_tokens, prompt_tokens = _trtllm_parse_output(out)
+            if ttft <= 0:
+                ttft = e2e / max(output_tokens, 1)
+            tps = output_tokens / e2e if e2e > 0 else 0.0
+
+            collector.add_request(RequestMetrics(
+                prompt=prompt,
+                output_text=text,
+                prompt_tokens=prompt_tokens,
+                output_tokens=output_tokens,
+                ttft=ttft,
+                e2e_latency=e2e,
+                tps=tps,
+            ))
+            if (i + 1) % 10 == 0:
+                avg_tps = sum(r.tps for r in collector._requests) / len(collector._requests)
+                print(f"  [{i+1}/{len(prompts)}] avg TPS: {avg_tps:.1f}")
+
+        collector.end_run()
+        return collector
+
+    def shutdown(self):
+        if hasattr(self.llm, "shutdown"):
+            self.llm.shutdown()
+
+
+class TRTLLMEagle3Runner:
+    """TRT-LLM Eagle3 speculative decoding runner."""
+
+    def __init__(
+        self,
+        base_model: str,
+        draft_model: str,
+        num_speculative_tokens: int = 5,
+        max_new_tokens: int = 256,
+        temperature: float = 0.0,
+        gpu_memory_utilization: float = 0.45,
+        dtype: str = "float16",
+    ):
+        _trtllm_maybe_enable_single_process_tp1()
+        _trtllm_check_import()
+        from tensorrt_llm import LLM, SamplingParams
+
+        print(f"[TRTLLMEagle3Runner] Loading {base_model}")
+        print(f"[TRTLLMEagle3Runner] + Eagle3 draft: {draft_model}")
+        self.base_model = base_model
+        self.draft_model = draft_model
+        self.num_speculative_tokens = num_speculative_tokens
+
+        eagle_cfg = _trtllm_eagle_config(draft_model, num_speculative_tokens)
+        init_kw: dict = dict(
+            model=base_model,
+            dtype=dtype,
+            trust_remote_code=True,
+            speculative_config=eagle_cfg,
+        )
+        kv = _trtllm_kv_cache(gpu_memory_utilization)
+        if kv is not None:
+            init_kw["kv_cache_config"] = kv
+
+        self.llm = LLM(**init_kw)
+        self.sampling_params = SamplingParams(
+            max_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=1.0,
+        )
+        print("[TRTLLMEagle3Runner] Base + Eagle3 draft loaded.")
+
+    def warmup(self, prompts: list, n: int = 3):
+        print(f"[TRTLLMEagle3Runner] Warming up ({n} runs) ...")
+        for _ in range(n):
+            self.llm.generate(prompts[:1], self.sampling_params)
+
+    def run(self, prompts: list, warmup_runs: int = 3) -> MetricsCollector:
+        self.warmup(prompts, warmup_runs)
+        collector = MetricsCollector(
+            run_type="trtllm_eagle3",
+            model=self.base_model,
+            draft_model=self.draft_model,
+        )
+        print(f"[TRTLLMEagle3Runner] Running {len(prompts)} prompts ...")
+
+        collector.start_run()
+        for i, prompt in enumerate(prompts):
+            out, ttft, e2e = _trtllm_run_prompt(self.llm, prompt, self.sampling_params)
+            if out is None:
+                continue
+
+            text, output_tokens, prompt_tokens = _trtllm_parse_output(out)
+            if ttft <= 0:
+                ttft = e2e / max(output_tokens, 1)
+            tps = output_tokens / e2e if e2e > 0 else 0.0
+
+            # Estimate acceptance rate — same heuristic as Eagle3Runner
+            k = self.num_speculative_tokens
+            num_draft_steps = max(1, (output_tokens + k) // (k + 1))
+            estimated_accepted = max(0, output_tokens - num_draft_steps)
+            total_drafted = num_draft_steps * k
+            acceptance_rate = estimated_accepted / total_drafted if total_drafted > 0 else None
+
+            collector.add_request(RequestMetrics(
+                prompt=prompt,
+                output_text=text,
+                prompt_tokens=prompt_tokens,
+                output_tokens=output_tokens,
+                ttft=ttft,
+                e2e_latency=e2e,
+                tps=tps,
+                num_draft_steps=num_draft_steps,
+                accepted_tokens=estimated_accepted,
+                acceptance_rate=acceptance_rate,
+            ))
+            if (i + 1) % 10 == 0:
+                avg_tps = sum(r.tps for r in collector._requests) / len(collector._requests)
+                print(f"  [{i+1}/{len(prompts)}] avg TPS: {avg_tps:.1f}")
+
+        collector.end_run()
+        return collector
+
+    def shutdown(self):
+        if hasattr(self.llm, "shutdown"):
+            self.llm.shutdown()
